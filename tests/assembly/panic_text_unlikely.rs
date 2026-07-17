@@ -49,18 +49,19 @@ pub fn entrypoint(input: *mut u8) -> u64 {
 }
 
 // CHECK,panic_path: rodata-count: 0
-// CHECK,panic_path: label {{.*panic_fmt}}
 // CHECK,panic_path: label entrypoint
 // CHECK,panic_path: jne r1, 0x0, +0x2
+// CHECK,panic_path: call {{.*panic}}
+// CHECK,panic_path: label {{.*panic_fmt}}
 // CHECK,panic_path: call {{.*panic_fmt}}
 
 // CHECK,bounds_check: rodata-count: 0
-// CHECK,bounds_check: label {{.*panic_bounds_check}}
-// CHECK,bounds_check: label {{.*panic_fmt}}
 // CHECK,bounds_check: label entrypoint
 // CHECK,bounds_check: jne r1, 0x0, +0x2
 // CHECK,bounds_check: mov64 r0, 0x7
 // CHECK,bounds_check: call {{.*panic_bounds_check}}
+// CHECK,bounds_check: label {{.*panic_fmt}}
+// CHECK,bounds_check: label {{.*panic_bounds_check}}
 // CHECK,bounds_check: call {{.*panic_fmt}}
 
 // CHECK,named_call: rodata-count: 0
@@ -69,7 +70,7 @@ pub fn entrypoint(input: *mut u8) -> u64 {
 // CHECK,named_call: call callee
 
 // CHECK,unwrap_case: rodata-count: 0
-// CHECK,unwrap_case: label {{.*unwrap_failed}}
 // CHECK,unwrap_case: label entrypoint
 // CHECK,unwrap_case: call {{.*unwrap_failed}}
+// CHECK,unwrap_case: label {{.*unwrap_failed}}
 // CHECK,unwrap_case-NOT: call -0x1

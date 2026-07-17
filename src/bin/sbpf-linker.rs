@@ -19,7 +19,9 @@ use tracing::{Level, info};
 use tracing_subscriber::{EnvFilter, fmt::MakeWriter, prelude::*};
 use tracing_tree::HierarchicalLayer;
 
-use sbpf_linker::{SbpfLinkerError, link_program};
+use sbpf_linker::{
+    OptimizationConfig, SbpfArch, SbpfLinkerError, link_program,
+};
 
 #[derive(Debug, Error)]
 enum CliError {
@@ -31,6 +33,12 @@ enum CliError {
         "unknown emission type: `{0}` - expected one of: `llvm-bc`, `asm`, `llvm-ir`, `obj`"
     )]
     InvalidOutputType(String),
+    #[error("unknown architecture: `{0}` - expected one of: `v0`, `v3`")]
+    InvalidArch(String),
+    #[error(
+        "sBPF architecture `v0` only supports CPU architectures `generic`, `v1`, or `v2` (instead was `{0}`)"
+    )]
+    UnsupportedV0Cpu(Cpu),
 
     #[error("SBPF Linker Error. Error detail: ({0}).")]
     SbpfLinkerError(#[from] SbpfLinkerError),
@@ -70,6 +78,21 @@ impl FromStr for CliOutputType {
             "llvm-ir" => OutputType::LlvmAssembly,
             "obj" => OutputType::Object,
             _ => return Err(CliError::InvalidOutputType(s.to_string())),
+        }))
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct CliArch(SbpfArch);
+
+impl FromStr for CliArch {
+    type Err = CliError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(match s {
+            "v0" => SbpfArch::V0,
+            "v3" => SbpfArch::V3,
+            _ => return Err(CliError::InvalidArch(s.to_string())),
         }))
     }
 }
@@ -156,7 +179,12 @@ struct CommandLine {
     /// LLVM 22 builds also support allows-misaligned-mem-access. Use +feature to enable a
     /// feature, or -feature to disable it. For example
     /// --cpu-features=+allows-misaligned-mem-access,+alu32,-dwarfris
-    #[clap(long, value_name = "features", default_value = "")]
+    #[clap(
+        long,
+        value_name = "features",
+        default_value = "",
+        allow_hyphen_values = true
+    )]
     cpu_features: CString,
 
     /// Write output to <output>
@@ -212,6 +240,18 @@ struct CommandLine {
     /// Dump the final IR module to the given `path` before generating the code
     #[clap(long, value_name = "path")]
     dump_module: Option<PathBuf>,
+
+    /// Write CFG .dot dumps to this directory
+    #[clap(long, value_name = "dir")]
+    dump_cfg_dir: Option<PathBuf>,
+
+    /// Enable SBPF assembler optimizations
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    sbpf_optimize: bool,
+
+    /// sBPF target architecture. Can be one of `v0`, `v3`
+    #[clap(long, default_value = "v3")]
+    arch: CliArch,
 
     /// Extra command line arguments to pass to LLVM
     #[clap(long, value_name = "args", use_value_delimiter = true, action = clap::ArgAction::Append)]
@@ -300,6 +340,11 @@ where
     }
 
     let cpu = cli.override_cpu_flag.unwrap();
+    if matches!(cli.arch.0, SbpfArch::V0)
+        && !matches!(cpu, Cpu::Generic | Cpu::V1 | Cpu::V2)
+    {
+        return Err(CliError::UnsupportedV0Cpu(cpu).into());
+    }
 
     Ok(CommandLine {
         target: cli.target,
@@ -318,6 +363,9 @@ where
         unroll_loops: cli.unroll_loops,
         ignore_inline_never: cli.ignore_inline_never,
         dump_module: cli.dump_module,
+        dump_cfg_dir: cli.dump_cfg_dir,
+        sbpf_optimize: cli.sbpf_optimize,
+        arch: cli.arch,
         llvm_args,
         disable_expand_memcpy_in_order: cli.disable_expand_memcpy_in_order,
         disable_memory_builtins: cli.disable_memory_builtins,
@@ -350,6 +398,9 @@ fn main() -> anyhow::Result<()> {
         unroll_loops,
         ignore_inline_never,
         dump_module,
+        dump_cfg_dir,
+        sbpf_optimize,
+        arch,
         disable_expand_memcpy_in_order,
         disable_memory_builtins,
         mut inputs,
@@ -445,7 +496,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     let program = std::fs::read(&output).unwrap();
-    let bytecode = link_program(&program)?;
+    let sbpf_optimization = if sbpf_optimize {
+        match dump_cfg_dir {
+            Some(dir) => OptimizationConfig::enabled().with_cfg_dump_dir(dir),
+            None => OptimizationConfig::enabled(),
+        }
+    } else {
+        OptimizationConfig::disabled()
+    };
+    let bytecode = link_program(&program, sbpf_optimization, arch.0)?;
 
     let src_name = std::path::Path::new(&output)
         .file_stem()
@@ -512,11 +571,15 @@ mod tests {
             deploy,
             cpu_features,
             llvm_args,
+            sbpf_optimize,
+            arch,
             ..
         } = process_cli_options(args).unwrap();
         assert!(matches!(cpu, Cpu::V2));
         assert!(disable_expand_memcpy_in_order);
         assert!(deploy);
+        assert!(sbpf_optimize);
+        assert!(matches!(arch.0, SbpfArch::V3));
 
         assert_eq!(cpu_features.to_bytes(), b"+allows-misaligned-mem-access");
         assert!(
@@ -533,11 +596,13 @@ mod tests {
             "input.o",
             "-o",
             "/tmp/bin.so",
-            "--override-cpu-flag=v3",
+            "--override-cpu-flag=v1",
             "--emit=llvm-ir",
             "--deploy=false",
             "--fatal-errors=false",
             "--disable-expand-memcpy-in-order=false",
+            "--sbpf-optimize=false",
+            "--arch=v0",
         ]
         .into_iter()
         .map(|s| s.to_string());
@@ -547,16 +612,20 @@ mod tests {
             deploy,
             fatal_errors,
             disable_expand_memcpy_in_order,
+            sbpf_optimize,
+            arch,
             output,
             ..
         } = process_cli_options(args).unwrap();
 
-        assert!(matches!(cpu, Cpu::V3));
         assert_eq!(emit.len(), 1);
         assert!(matches!(emit[0], CliOutputType(OutputType::LlvmAssembly)));
         assert!(!deploy);
         assert!(!fatal_errors);
         assert!(!disable_expand_memcpy_in_order);
+        assert!(!sbpf_optimize);
+        assert!(matches!(cpu, Cpu::V1));
+        assert!(matches!(arch.0, SbpfArch::V0));
         assert_eq!(output, PathBuf::from("/tmp/bin.so"));
     }
 
@@ -632,6 +701,27 @@ mod tests {
     }
 
     #[test]
+    fn test_cpu_features_accepts_split_disabled_feature() {
+        let args = [
+            "sbpf-linker",
+            "input.o",
+            "-o",
+            "/tmp/bin.o",
+            "--cpu-features",
+            "-alu32",
+        ]
+        .into_iter()
+        .map(|s| s.to_string());
+        let CommandLine { cpu_features, .. } =
+            process_cli_options(args).unwrap();
+
+        assert_eq!(
+            cpu_features.to_bytes(),
+            b"-alu32,+allows-misaligned-mem-access"
+        );
+    }
+
+    #[test]
     fn test_override_cpu() {
         let args = [
             "sbpf-linker",
@@ -654,5 +744,25 @@ mod tests {
             .map(|s| s.to_string());
         let CommandLine { cpu, .. } = process_cli_options(args).unwrap();
         assert!(matches!(cpu, Cpu::V2));
+    }
+
+    #[test]
+    fn test_sbpf_v0_rejects_unsupported_cpu_arches() {
+        for unsupported_cpu in ["probe", "v3"] {
+            let args = vec![
+                "sbpf-linker".to_string(),
+                "input.o".to_string(),
+                "-o".to_string(),
+                "/tmp/bin.o".to_string(),
+                "--arch=v0".to_string(),
+                format!("--override-cpu-flag={unsupported_cpu}"),
+            ]
+            .into_iter();
+
+            let error = process_cli_options(args).unwrap_err();
+            assert!(error.to_string().contains(
+                "sBPF architecture `v0` only supports CPU architectures"
+            ));
+        }
     }
 }

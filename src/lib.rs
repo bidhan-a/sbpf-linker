@@ -5,6 +5,7 @@ use bpf_linker::LinkerError;
 use byteparser::parse_bytecode;
 
 use sbpf_assembler::{CompileError, Program};
+pub use sbpf_assembler::{OptimizationConfig, SbpfArch};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SbpfLinkerError {
@@ -30,8 +31,12 @@ pub enum SbpfLinkerError {
     },
 }
 
-pub fn link_program(source: &[u8]) -> Result<Vec<u8>, SbpfLinkerError> {
-    let parse_result = parse_bytecode(source)?;
+pub fn link_program(
+    source: &[u8],
+    opt_config: OptimizationConfig,
+    arch: SbpfArch,
+) -> Result<Vec<u8>, SbpfLinkerError> {
+    let parse_result = parse_bytecode(source, opt_config, arch)?;
     let program = Program::from_parse_result(parse_result, None);
     let bytecode = program.emit_bytecode();
 

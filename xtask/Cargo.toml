@@ -5,5 +5,5 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-dirs = "5"
+dirs = "6"
 walkdir.workspace = true

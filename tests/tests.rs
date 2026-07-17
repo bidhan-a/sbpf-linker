@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -12,7 +12,9 @@ use std::{
 use either::Either;
 use object::{File, Object as _, ObjectSection as _};
 use sbpf_assembler::{
+    OptimizationConfig, SbpfArch,
     astnode::{ASTNode, ROData},
+    header::ProgramHeader,
     parser::Token,
 };
 use sbpf_common::{
@@ -21,6 +23,51 @@ use sbpf_common::{
     opcode::Opcode,
 };
 use sbpf_linker::byteparser::parse_bytecode;
+
+const NO_TESTS_FILTER: &str = "__no_tests_match_this_sbpf_arch__";
+
+trait TestArch {
+    const ARCH: SbpfArch;
+
+    fn decode_instruction(
+        data: &[u8],
+    ) -> Result<Instruction, sbpf_common::errors::SBPFError>;
+
+    fn arch_arg() -> String {
+        format!("v{}", Self::ARCH.e_flags())
+    }
+
+    fn dump(src: &Path, dst: &Path)
+    where
+        Self: Sized,
+    {
+        sbpf_dump::<Self>(src, dst);
+    }
+}
+
+struct SbpfV0;
+
+impl TestArch for SbpfV0 {
+    const ARCH: SbpfArch = SbpfArch::V0;
+
+    fn decode_instruction(
+        data: &[u8],
+    ) -> Result<Instruction, sbpf_common::errors::SBPFError> {
+        Instruction::from_bytes(data)
+    }
+}
+
+struct SbpfV3;
+
+impl TestArch for SbpfV3 {
+    const ARCH: SbpfArch = SbpfArch::V3;
+
+    fn decode_instruction(
+        data: &[u8],
+    ) -> Result<Instruction, sbpf_common::errors::SBPFError> {
+        Instruction::from_bytes_sbpf_v3(data)
+    }
+}
 
 fn rustc_cmd() -> Command {
     Command::new(
@@ -34,13 +81,16 @@ fn find_binary(binary_re_str: &str) -> PathBuf {
     binary.next().unwrap_or_else(|| panic!("could not find {binary_re_str}"))
 }
 
-fn run_mode<F>(target: &str, mode: &str, sysroot: &Path, cfg: Option<F>)
+fn run_mode<A, F>(target: &str, mode: &str, sysroot: &Path, cfg: Option<F>)
 where
+    A: TestArch,
     F: Fn(&mut compiletest_rs::Config),
 {
+    let arch_arg = A::arch_arg();
     let target_rustcflags = format!(
-        "-C linker={} --sysroot {}",
+        "-C linker={} -C link-arg=--arch={} --sysroot {}",
         env!("CARGO_BIN_EXE_sbpf-linker"),
+        arch_arg,
         sysroot.display()
     );
 
@@ -61,11 +111,14 @@ where
         cfg(&mut config);
     }
 
+    config.filters = test_filters_for_arch::<A>(&config.src_base)
+        .expect("failed to filter tests by sBPF arch");
+
     compiletest_rs::run_tests(&config);
 }
 
-fn sbpf_dump(src: &Path, dst: &Path) {
-    let dump = render_emitted_program(src).unwrap_or_else(|err| {
+fn sbpf_dump<A: TestArch>(src: &Path, dst: &Path) {
+    let dump = render_emitted_program::<A>(src).unwrap_or_else(|err| {
         panic!("failed to render {}: {err}", src.display())
     });
     fs::write(dst, dump).unwrap_or_else(|err| {
@@ -73,11 +126,75 @@ fn sbpf_dump(src: &Path, dst: &Path) {
     });
 }
 
+fn test_filters_for_arch<A: TestArch>(
+    src_base: &Path,
+) -> io::Result<Vec<String>> {
+    let suite_name =
+        src_base.file_name().unwrap_or_default().to_string_lossy();
+    let arch_arg = A::arch_arg();
+    let mut filters = Vec::new();
+    collect_test_filters_for_arch(
+        src_base,
+        src_base,
+        &suite_name,
+        &mut filters,
+        &arch_arg,
+    )?;
+    filters.sort();
+    if filters.is_empty() {
+        filters.push(NO_TESTS_FILTER.to_owned());
+    }
+    Ok(filters)
+}
+
+fn collect_test_filters_for_arch(
+    src_base: &Path,
+    dir: &Path,
+    suite_name: &str,
+    filters: &mut Vec<String>,
+    arch_arg: &str,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // Compiletest builds auxiliary crates only when a fixture requests them.
+            if entry.file_name() != "auxiliary" {
+                collect_test_filters_for_arch(
+                    src_base, &path, suite_name, filters, arch_arg,
+                )?;
+            }
+        } else if path.extension().is_some_and(|extension| extension == "rs")
+            && !ignored_for_arch(&path, arch_arg)?
+        {
+            let relative_path = path.strip_prefix(src_base).unwrap_or(&path);
+            filters.push(format!("{suite_name}/{}", relative_path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn ignored_for_arch(path: &Path, arch_arg: &str) -> io::Result<bool> {
+    let contents = fs::read_to_string(path)?;
+    Ok(contents.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("//")
+            .map(str::trim_start)
+            .and_then(|line| line.strip_prefix("ignore-sbpf-arch:"))
+            .is_some_and(|ignored_arches| {
+                ignored_arches
+                    .split([',', ' ', '\t'])
+                    .any(|ignored_arch| ignored_arch.trim() == arch_arg)
+            })
+    }))
+}
+
 #[test]
 fn compile_test() {
     // Assembly fixtures live in `tests/assembly`. Each file is a tiny Rust
     // crate with compiletest directives at the top and inline `CHECK:` lines
-    // at the bottom. Run just this harness with:
+    // at the bottom. Use `// ignore-sbpf-arch: v0` or `v3` to skip a fixture
+    // for one linker arch. Run just this harness with:
     //
     // `cargo test --test tests compile_test -- --nocapture`
     //
@@ -111,21 +228,30 @@ fn compile_test() {
         directory
     };
 
-    run_mode(
+    run_mode::<SbpfV0, _>(
         target,
         "assembly",
         &bpf_sysroot,
         Some(|cfg: &mut compiletest_rs::Config| {
-            cfg.llvm_filecheck_preprocess = Some(sbpf_dump);
+            cfg.llvm_filecheck_preprocess = Some(SbpfV0::dump);
+        }),
+    );
+    run_mode::<SbpfV3, _>(
+        target,
+        "assembly",
+        &bpf_sysroot,
+        Some(|cfg: &mut compiletest_rs::Config| {
+            cfg.llvm_filecheck_preprocess = Some(SbpfV3::dump);
         }),
     );
 }
 
 // TODO: add below query methods to sbpf and update below to use them
-fn render_emitted_program(path: &Path) -> anyhow::Result<String> {
+fn render_emitted_program<A: TestArch>(path: &Path) -> anyhow::Result<String> {
     let bytes = fs::read(path)?;
-    let syscall_labels = collect_syscall_labels(&bytes)?;
-    let parse_result = parse_bytecode(&bytes)?;
+    let syscall_labels = collect_syscall_labels::<A>(&bytes)?;
+    let parse_result =
+        parse_bytecode(&bytes, OptimizationConfig::enabled(), A::ARCH)?;
     let ph_count = if parse_result.prog_is_static { 1u64 } else { 3u64 };
     let rodata_base =
         parse_result.code_section.get_size() + 64 + ph_count * 56;
@@ -146,14 +272,20 @@ fn render_emitted_program(path: &Path) -> anyhow::Result<String> {
         }
     }
 
-    for node in parse_result.code_section.get_nodes() {
+    let code_nodes = parse_result.code_section.get_nodes();
+    for node in code_nodes {
+        if let ASTNode::Label { label, offset } = node {
+            code_labels.insert(*offset as i64, label.name.clone());
+        }
+    }
+
+    for node in code_nodes {
         match node {
             ASTNode::Label { label, offset } => {
-                code_labels.insert(*offset as i64, label.name.clone());
                 out.push(format!("{offset:04x}: label {}", label.name));
             }
             ASTNode::Instruction { instruction, offset } => {
-                for asm in render_instruction(
+                for asm in render_instruction::<A>(
                     instruction,
                     *offset,
                     rodata_base,
@@ -172,7 +304,7 @@ fn render_emitted_program(path: &Path) -> anyhow::Result<String> {
     Ok(out.join("\n"))
 }
 
-fn render_instruction(
+fn render_instruction<A: TestArch>(
     instruction: &Instruction,
     offset: u64,
     rodata_base: u64,
@@ -203,10 +335,9 @@ fn render_instruction(
     if instruction.opcode == Opcode::Lddw
         && let Some(Either::Right(number)) = &instruction.imm
         && let Number::Int(value) | Number::Addr(value) = number
-        && (*value as u64) >= rodata_base
-        && (*value as u64) < rodata_base + rodata_len
+        && let Some(offset) =
+            rodata_offset_for_lddw::<A>(*value as u64, rodata_base, rodata_len)
     {
-        let offset = (*value as u64) - rodata_base;
         let dst = instruction.dst.as_ref().ok_or_else(|| {
             anyhow::anyhow!("lddw is missing a destination register")
         })?;
@@ -220,7 +351,19 @@ fn render_instruction(
     Ok(vec![instruction.to_asm(AsmFormat::Default)?])
 }
 
-fn collect_syscall_labels(
+fn rodata_offset_for_lddw<A: TestArch>(
+    value: u64,
+    rodata_base: u64,
+    rodata_len: u64,
+) -> Option<u64> {
+    let rodata_vaddr =
+        ProgramHeader::new_load(rodata_base, rodata_len, false, A::ARCH)
+            .p_vaddr;
+    (value >= rodata_vaddr && value < rodata_vaddr + rodata_len)
+        .then_some(value - rodata_vaddr)
+}
+
+fn collect_syscall_labels<A: TestArch>(
     bytes: &[u8],
 ) -> anyhow::Result<HashMap<u64, String>> {
     let obj = File::parse(bytes)?;
@@ -233,7 +376,7 @@ fn collect_syscall_labels(
     let mut offset = 0usize;
     while offset < data.len() {
         let instruction =
-            Instruction::from_bytes(&data[offset..]).map_err(|err| {
+            A::decode_instruction(&data[offset..]).map_err(|err| {
                 anyhow::anyhow!("failed to decode .text at {offset:#x}: {err}")
             })?;
         if instruction.opcode == Opcode::Call

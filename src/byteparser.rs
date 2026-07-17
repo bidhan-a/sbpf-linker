@@ -1,8 +1,9 @@
-use sbpf_assembler::Token;
-use sbpf_assembler::ast::AST;
+use crate::SbpfLinkerError;
+
+use sbpf_assembler::ast::{AST, build_program};
 use sbpf_assembler::astnode::{ASTNode, GlobalDecl, Label, ROData};
-use sbpf_assembler::parser::ParseResult;
 use sbpf_assembler::section::DebugSection;
+use sbpf_assembler::{OptimizationConfig, ProgramLayout, SbpfArch, Token};
 use sbpf_common::{
     inst_param::Number, instruction::Instruction, opcode::Opcode,
 };
@@ -15,7 +16,16 @@ use object::{
 
 use std::collections::HashMap;
 
-use crate::SbpfLinkerError;
+fn decode_instruction_for_arch(
+    data: &[u8],
+    arch: SbpfArch,
+) -> Result<Instruction, sbpf_common::errors::SBPFError> {
+    if arch.is_v3() {
+        Instruction::from_bytes_sbpf_v3(data)
+    } else {
+        Instruction::from_bytes(data)
+    }
+}
 
 // Staged rodata region. We collect these before emitting so we can sort by
 // address and fill anonymous gaps before the AST is built.
@@ -27,7 +37,11 @@ struct RodataEntry {
     bytes: Vec<Number>,
 }
 
-pub fn parse_bytecode(bytes: &[u8]) -> Result<ParseResult, SbpfLinkerError> {
+pub fn parse_bytecode(
+    bytes: &[u8],
+    opt_config: OptimizationConfig,
+    arch: SbpfArch,
+) -> Result<ProgramLayout, SbpfLinkerError> {
     let mut ast = AST::new();
 
     let obj = File::parse(bytes)?;
@@ -209,7 +223,7 @@ pub fn parse_bytecode(bytes: &[u8]) -> Result<ParseResult, SbpfLinkerError> {
             let mut offset = 0;
             while offset < section_data.len() {
                 let data = &section_data[offset..];
-                let instruction = Instruction::from_bytes(data);
+                let instruction = decode_instruction_for_arch(data, arch);
                 if let Err(error) = instruction {
                     return Err(SbpfLinkerError::InstructionParseError(
                         error.to_string(),
@@ -364,8 +378,28 @@ pub fn parse_bytecode(bytes: &[u8]) -> Result<ParseResult, SbpfLinkerError> {
 
     ast.set_text_size(text_size);
 
-    let mut parse_result = ast
-        .build_program(sbpf_assembler::SbpfArch::V0)
+    // Sort ast.nodes in source order: each label immediately before the
+    // instruction at the same byte offset. The CFG builder expects source-order
+    // input and no longer sorts internally. Non-label/instruction nodes
+    // (GlobalDecl, etc.) are kept at the front in their original order.
+    {
+        let (mut metadata, mut text): (Vec<ASTNode>, Vec<ASTNode>) =
+            std::mem::take(&mut ast.nodes).into_iter().partition(|n| {
+                !matches!(
+                    n,
+                    ASTNode::Label { .. } | ASTNode::Instruction { .. }
+                )
+            });
+        text.sort_by_key(|node| match node {
+            ASTNode::Label { offset, .. } => (*offset, 0u8),
+            ASTNode::Instruction { offset, .. } => (*offset, 1u8),
+            _ => unreachable!(),
+        });
+        metadata.append(&mut text);
+        ast.nodes = metadata;
+    }
+
+    let mut parse_result = build_program(ast, arch, opt_config)
         .map_err(|errors| SbpfLinkerError::BuildProgramError { errors })?;
 
     parse_result.debug_sections = debug_sections;
